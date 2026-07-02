@@ -1,9 +1,11 @@
+
 <!DOCTYPE html>
 <html lang="es-MX">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Inventario Azul Web</title>
+  <title>Inventario Azul</title>
+
   <style>
     :root {
       --blue: #0b4ea2;
@@ -187,6 +189,7 @@
       background: #fff;
       color: var(--muted);
       font-size: 13px;
+      line-height: 1.35;
     }
 
     .stats {
@@ -271,6 +274,7 @@
     }
   </style>
 </head>
+
 <body>
   <main class="app">
     <header class="header">
@@ -289,6 +293,11 @@
         <video id="video" playsinline muted></video>
         <p class="camera-note" id="cameraNote">Apunta la cámara al código de barras.</p>
       </div>
+
+      <p class="note">
+        En iPhone la cámara necesita abrirse desde HTTPS, por ejemplo GitHub Pages.
+        Esta versión usa ZXing JS para mejorar compatibilidad con Safari.
+      </p>
     </section>
 
     <section class="card">
@@ -413,14 +422,17 @@
 
   <div class="toast" id="toast"></div>
 
+  <!-- ZXing JS: librería para leer códigos de barras con cámara -->
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@latest/umd/index.min.js"></script>
+
   <script>
-    const STORAGE_KEY = "inventario_azul_simple_web";
+    const STORAGE_KEY = "inventario_azul_zxing_web";
+
     let products = [];
     let editingId = null;
-    let stream = null;
-    let detector = null;
-    let scanning = false;
-    let scanTimer = null;
+    let codeReader = null;
+    let selectedDeviceId = null;
+    let scannerRunning = false;
 
     const $ = (id) => document.getElementById(id);
 
@@ -465,7 +477,7 @@
       el.textContent = message;
       el.classList.add("show");
       clearTimeout(el.timer);
-      el.timer = setTimeout(() => el.classList.remove("show"), 2200);
+      el.timer = setTimeout(() => el.classList.remove("show"), 2400);
     }
 
     function loadProducts() {
@@ -748,82 +760,98 @@
     }
 
     async function startScanner() {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        toast("Este navegador no permite cámara aquí");
+      if (scannerRunning) {
+        stopScanner();
         return;
       }
 
-      if (!("BarcodeDetector" in window)) {
-        toast("Escaneo no compatible. Escribe el código manualmente.");
+      if (!window.ZXing) {
+        toast("No cargó ZXing. Revisa internet o el CDN.");
+        return;
+      }
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        toast("La cámara requiere HTTPS en iPhone.");
         return;
       }
 
       try {
-        try {
-          detector = new BarcodeDetector({
-            formats: ["ean_13", "ean_8", "upc_a", "upc_e", "code_128", "code_39", "itf"]
-          });
-        } catch {
-          detector = new BarcodeDetector();
-        }
-
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" }
-          },
-          audio: false
-        });
-
-        const video = $("video");
-        video.srcObject = stream;
-        await video.play();
+        codeReader = new ZXing.BrowserMultiFormatReader();
 
         $("cameraBox").classList.add("active");
-        $("cameraNote").textContent = "Buscando código...";
-        scanning = true;
-        scanLoop();
-      } catch {
+        $("cameraNote").textContent = "Solicitando permiso de cámara...";
+
+        let devices = [];
+        try {
+          devices = await codeReader.listVideoInputDevices();
+        } catch {
+          devices = [];
+        }
+
+        if (devices.length > 0) {
+          const backCamera = devices.find(device =>
+            /back|rear|environment|trasera|posterior/i.test(device.label || "")
+          );
+
+          selectedDeviceId = backCamera
+            ? backCamera.deviceId
+            : devices[devices.length - 1].deviceId;
+        } else {
+          selectedDeviceId = null;
+        }
+
+        $("cameraNote").textContent = "Buscando código de barras...";
+
+        scannerRunning = true;
+        $("scanBtn").textContent = "Detener escáner";
+
+        await codeReader.decodeFromVideoDevice(selectedDeviceId, "video", (result, error) => {
+          if (result) {
+            const code = clean(result.getText ? result.getText() : result.text);
+
+            if (code) {
+              fields.barcode.value = code;
+              stopScanner();
+
+              const existing = products.find(p => p.barcode === code);
+              if (existing) {
+                fillForm(existing);
+                toast("Código encontrado");
+              } else {
+                fields.name.focus();
+                toast("Código capturado");
+              }
+            }
+          }
+        });
+      } catch (error) {
+        stopScanner();
+        $("cameraNote").textContent = "No se pudo abrir la cámara.";
         toast("No se pudo abrir la cámara");
       }
     }
 
-    async function scanLoop() {
-      if (!scanning || !detector) return;
+    function stopScanner() {
+      scannerRunning = false;
+      $("scanBtn").textContent = "Escanear código";
+      $("cameraBox").classList.remove("active");
 
       try {
-        const codes = await detector.detect($("video"));
-
-        if (codes && codes.length && codes[0].rawValue) {
-          const code = clean(codes[0].rawValue);
-          fields.barcode.value = code;
-          stopScanner();
-
-          const existing = products.find(p => p.barcode === code);
-          if (existing) {
-            fillForm(existing);
-            toast("Código encontrado");
-          } else {
-            fields.name.focus();
-            toast("Código capturado");
-          }
-          return;
+        if (codeReader) {
+          codeReader.reset();
         }
       } catch {}
 
-      scanTimer = setTimeout(scanLoop, 300);
-    }
+      const video = $("video");
+      try {
+        if (video.srcObject) {
+          video.srcObject.getTracks().forEach(track => track.stop());
+        }
+      } catch {}
 
-    function stopScanner() {
-      scanning = false;
-      clearTimeout(scanTimer);
-
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        stream = null;
-      }
-
-      $("video").srcObject = null;
-      $("cameraBox").classList.remove("active");
+      video.srcObject = null;
+      codeReader = null;
+      selectedDeviceId = null;
     }
 
     fields.contentType.addEventListener("change", () => {
